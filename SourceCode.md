@@ -17,14 +17,16 @@ background assumed.
 6. [Filesystem primitives — the actual file operations](#6-filesystem-primitives)
 7. [Recursive helpers — walking folder trees](#7-recursive-helpers)
 8. [UI theming — colours, fonts, styles](#8-ui-theming)
-9. [App class overview](#9-app-class-overview)
-10. [Titlebar and navigation](#10-titlebar-and-navigation)
-11. [Transfer page](#11-transfer-page)
-12. [Scan page](#12-scan-page)
-13. [Find and Replace](#13-find-and-replace)
-14. [Apply Renames](#14-apply-renames)
-15. [Settings modal](#15-settings-modal)
-16. [Entry point — starting the app](#16-entry-point)
+9. [Pure logic helpers — testable module-level functions](#9-pure-logic-helpers)
+10. [App class overview](#10-app-class-overview)
+11. [Titlebar and navigation](#11-titlebar-and-navigation)
+12. [Transfer page](#12-transfer-page)
+13. [Scan page](#13-scan-page)
+14. [Find and Replace](#14-find-and-replace)
+15. [Apply Renames](#15-apply-renames)
+16. [Logs tab](#16-logs-tab)
+17. [Settings modal](#17-settings-modal)
+18. [Entry point — starting the app](#18-entry-point)
 
 ---
 
@@ -59,6 +61,7 @@ import time
 import tkinter as tk
 from ctypes import wintypes
 from tkinter import filedialog, messagebox, ttk
+import tkinter.font as tkfont
 ```
 
 Python can't do everything on its own — it borrows pre-built modules (called
@@ -78,6 +81,7 @@ module X so the code can use it.
 | `tkinter` | The GUI toolkit — windows, buttons, labels, tree views. |
 | `wintypes` | Windows-specific C data types (`DWORD`, `BOOL`, `LPCWSTR` etc.) needed when calling Win32. |
 | `filedialog`, `messagebox`, `ttk` | Sub-modules of tkinter: file picker dialogs, pop-up messages, and themed widgets. |
+| `tkinter.font` (as `tkfont`) | Lets the code measure how wide a string is in pixels for a given font — used by column auto-fit. |
 
 ---
 
@@ -413,6 +417,8 @@ DEFAULT_SETTINGS = {
     "sans_family":     "Segoe UI",
     "mono_family":     "Cascadia Mono",
     "visible_cols":    ["len", "newlen", "kind", "orig", "new"],
+    "col_widths":      {"len": 80, "newlen": 100, "kind": 64, "orig": 600, "new": 600},
+    "last_root":       "",
 }
 ```
 
@@ -420,6 +426,11 @@ These are just Python dictionaries — keys map to values. `THEMES` holds two
 colour palettes. `ACCENTS` holds accent colour sets: `transfer` and `scan` are
 the per-page defaults; the others are user-selectable overrides. Settings have
 sensible defaults that get overwritten when a `settings.json` file is found.
+
+Two keys were added in v1.1:
+
+- **`col_widths`** — a nested dictionary mapping each column ID to its pixel width. Written when the window closes and after each auto-fit. Restored on startup so the table looks the same as when you left it.
+- **`last_root`** — the path the user most recently scanned. Written at the start of each scan and pre-filled into the ROOT field on startup.
 
 ### `_fonts(settings)`
 
@@ -492,7 +503,61 @@ app still works, it just looks stock.
 
 ---
 
-## 9. App class overview
+## 9. Pure logic helpers
+
+Three module-level functions sit between the UI-theming code and the `App`
+class. They contain no tkinter dependencies, so `test_logic.py` can import and
+call them directly — any regression in their behaviour immediately fails the
+tests.
+
+### `normalise_replacement(repl)`
+
+Converts the backreference syntax a user might type in the Replace field into
+the form Python's `re` module understands:
+
+| User writes | Python needs |
+|---|---|
+| `$1` | `\1` |
+| `${1}` | `\g<1>` |
+| `${name}` | `\g<name>` |
+
+Implemented as three sequential `re.sub` calls. Applied before every regex
+substitution so users can use either `$1` or `\1` interchangeably.
+
+### `apply_replacement(find, repl, text, *, regex, case) → (result, changed)`
+
+Applies one find/replace operation to a single path string. Returns a
+`(result, changed)` tuple where `changed` is `True` if at least one
+substitution was made.
+
+Covers four combinations of `regex` × `case`:
+
+- **regex + case-sensitive** — compile, normalise replacement, `subn`
+- **regex + case-insensitive** — same with `re.IGNORECASE`
+- **literal + case-sensitive** — plain `str.replace`
+- **literal + case-insensitive** — `re.compile(re.escape(find), IGNORECASE).subn(lambda m: repl, text)`
+
+The lambda in the last case is critical: passing `repl` as a callable instead
+of a string tells `subn` to use it literally, so `C:\new\folder` in the
+Replace field is never expanded as `C:` + newline + `ew` + form-feed + `older`.
+
+Raises `re.error` for invalid patterns or replacements, letting `_bulk_replace`
+catch and display the error before touching any rows.
+
+`re.compile` results are cached by the standard library, so calling this in a
+loop of 300 000 rows with the same `find` and `flags` is not meaningfully
+slower than compiling once outside the loop.
+
+### `rename_segment_walk(mapping, rename_fn, log_fn=None) → (ok, fail, done_renames)`
+
+The core algorithm for safe bulk renaming. See [Apply Renames](#15-apply-renames)
+for a full explanation. Extracted here so `test_logic.py` can inject a mock
+`rename_fn` and assert exactly which physical renames fire and in what order,
+without touching the filesystem.
+
+---
+
+## 10. App class overview
 
 ```python
 class App(tk.Tk):
@@ -512,12 +577,13 @@ root window class. The `__init__` method runs once when the app starts.
 |---|---|---|
 | `self.settings` | `dict` | Mirror of `settings.json`. Written on every change. |
 | `self.theme` | `str` | `"light"` or `"dark"`. |
-| `self.current_page` | `str` | `"scan"` or `"transfer"`. |
+| `self.current_page` | `str` | `"scan"`, `"transfer"`, or `"logs"`. |
 | `self.rows` | `dict[str, dict]` | `{id: {orig, new, is_dir}}` — the scan results table data. |
 | `self._busy` | `bool` | True while a background operation is running; prevents double-clicks. |
 | `self._scan_cancel` | `bool` | Set to `True` by the Cancel button; the scan thread polls this. |
 | `self._log_q` | `queue.Queue` | Thread-safe inbox for log messages from background workers. |
 | `self._text_widgets` | `list` | Raw `tk.Text` widgets tracked so they can be re-themed. |
+| `self._log_unread` | `int` | Count of log messages received while the Logs tab is not active. Reset to 0 when the user opens the Logs tab. |
 
 ### The layout stack
 
@@ -525,24 +591,27 @@ root window class. The `__init__` method runs once when the app starts.
 App (tk.Tk root window)
 ├── Titlebar (TFrame, Titlebar.TFrame style)
 │     ├── LPB logo (Canvas)
-│     ├── Nav buttons (🔍 Scan & Rename, 📦 Transfer)
+│     ├── Nav buttons (🔍 Scan & Rename, 📦 Transfer, 📋 Logs)
 │     └── Icon buttons (⚙ Settings, [D] theme toggle)
 ├── Separator (hairline border below titlebar)
 ├── Status bar (pinned to bottom with side="bottom")
-└── Main area (fills everything between titlebar and status bar)
-      ├── Activity log (pinned to bottom of main)
-      └── Pages host
-            ├── Scan page (default visible)
-            └── Transfer page (hidden until selected)
+└── Pages host (fills everything between titlebar and status bar)
+      ├── Scan page (default visible)
+      ├── Transfer page (hidden until selected)
+      └── Logs page (hidden until selected)
 ```
 
-The status bar is packed `side="bottom"` *before* the main area, which means
+The status bar is packed `side="bottom"` *before* the pages host, which means
 tkinter reserves space for it first. This is why the status bar always appears
 at the very bottom even when the window is resized.
 
+In v1.0 the activity log was permanently pinned to the bottom of the main area.
+In v1.1 it was moved to a dedicated Logs page so the Scan and Transfer pages
+have the full vertical height available.
+
 ---
 
-## 10. Titlebar and navigation
+## 11. Titlebar and navigation
 
 ### `_draw_logo()`
 
@@ -576,9 +645,27 @@ Shows one page and hides all others using `pack_forget()` — the frames still
 exist in memory, they're just not attached to the layout. This is a common
 tkinter pattern for tab-switching without a `Notebook` widget.
 
+When the user navigates to the Logs page, `_set_page` also resets `_log_unread`
+to 0 and calls `_update_log_badge()` to clear the badge.
+
+### `_update_log_badge()`
+
+```python
+def _update_log_badge(self):
+    if self._log_unread > 0:
+        self._nav_btns["logs"].config(text=f"📋  Logs  ({self._log_unread})")
+    else:
+        self._nav_btns["logs"].config(text="📋  Logs")
+```
+
+Updates the Logs nav button label to show `"📋  Logs  (3)"` when there are
+unread messages, or plain `"📋  Logs"` when there are none. Called from
+`_drain_log` every time a message arrives while the Logs tab is not visible,
+and from `_set_page` when the user navigates to the Logs tab.
+
 ---
 
-## 11. Transfer page
+## 12. Transfer page
 
 The Transfer page lets the user paste (or browse for) a list of long-path
 files/folders and then Copy, Move, or Delete them all.
@@ -615,18 +702,19 @@ the window without waiting for it to finish.
 
 ---
 
-## 12. Scan page
+## 13. Scan page
 
 ### Controls
 
 The scan page has these controls, top to bottom:
 
-1. **ROOT** — path entry + Browse + Scan + Cancel buttons
+1. **ROOT** — path entry (pre-filled from `last_root`) + Browse + Scan + Cancel buttons
 2. **Progress bar** + status text
 3. **Filter row** — MIN LENGTH spinbox · Folders checkbox · Files checkbox · MAX FILES spinbox · Split path checkbox
 4. **Find/Replace row** — Find entry · Replace entry · .* regex checkbox · Aa case checkbox · Apply button
 5. **Regex status label** — shows error messages when a regex is invalid
 6. **Treeview** — the results table with columns: LENGTH, NEW LENGTH, KIND, ORIGINAL PATH, NEW PATH
+7. **Apply Renames bar** — always pinned below the treeview (packed `side="bottom"` before the treeview so it can never be pushed out of view)
 
 ### `_scan()`
 
@@ -682,21 +770,93 @@ backslashes. The display transform only affects what appears in the table.
 ```python
 def _on_double_click(self, event):
     ...
-    entry = tk.Entry(self.tree, ...)
+    popup = tk.Frame(self.tree, bg=c.get("border", "#ccc"), bd=0)
+    entry = tk.Entry(popup, font=self._f["sans"], bd=0, relief="flat", ...)
+    xsb   = ttk.Scrollbar(popup, orient="horizontal", command=entry.xview)
+    entry.configure(xscrollcommand=xsb.set)
+    entry.pack(fill="x", ipady=1)
+    xsb.pack(fill="x")
+    sb_h = xsb.winfo_reqheight() or 14
+    popup.place(x=0, y=y-1, width=tree_w, height=h+sb_h+2)
     entry.insert(0, self.rows[rid]["new"])
-    entry.place(x=x, y=y-1, width=w, height=h+2)
     entry.bind("<Return>", commit)
     entry.bind("<FocusOut>", commit)
 ```
 
-When the user double-clicks the NEW PATH cell, a borderless `tk.Entry` widget
-is placed exactly over the cell using the cell's bounding box coordinates.
+When the user double-clicks the NEW PATH cell, a `tk.Frame` popup is placed
+over the treeview using `.place()`. The popup spans the **full width of the
+treeview** (not just the clicked cell) and contains a `tk.Entry` with a
+horizontal scrollbar beneath it.
+
+Using the full width (instead of just the cell width) means the user can scroll
+horizontally through very long paths — a narrow cell-width editor would clip
+paths at 200–300 characters.
+
 On `<Return>` or clicking away, `commit()` saves the new value back into
 `self.rows[rid]["new"]` and calls `_refresh_view()`.
 
+### Column auto-fit — `_autofit_path_columns()`
+
+After every scan completes, the ORIGINAL PATH and NEW PATH columns are
+automatically widened to fit the longest path in the results:
+
+```python
+def _autofit_path_columns(self):
+    import heapq
+    fnt    = tkfont.Font(family=fam, size=sz)
+    top_orig = heapq.nlargest(5, self.rows.values(), key=lambda r: len(r["orig"]))
+    top_new  = heapq.nlargest(5, self.rows.values(), key=lambda r: len(r["new"]))
+    max_orig_px = max(fnt.measure(r["orig"].replace("\\", sep_char)) for r in top_orig)
+    max_new_px  = max(fnt.measure(r["new"].replace( "\\", sep_char)) for r in top_new)
+    for col_id, measured in (("orig", max_orig_px), ("new", max_new_px)):
+        width = max(heading_min, measured + pad)
+        self.tree.column(col_id, width=width)
+    self._save_col_widths()
+```
+
+**Why `heapq.nlargest(5, ...)`?** Measuring the pixel width of a string
+(`fnt.measure()`) is an expensive Tk round-trip. With 300 000 paths in the
+table, calling it on every row would block the UI thread for tens of seconds.
+`heapq.nlargest` scans all rows in O(n) time but only returns the 5 longest
+ones by *character count*. The 5 longest characters are almost always the 5
+widest in pixels too (fonts aren't perfectly proportional, but it's close
+enough). We then call `fnt.measure()` on only those 5 strings — effectively O(1)
+measuring regardless of table size.
+
+### Saving and restoring column widths — `_save_col_widths()` / `_on_close()`
+
+```python
+def _save_col_widths(self):
+    widths = {col: self.tree.column(col, "width") for col in COL_IDS}
+    self.settings["col_widths"] = widths
+    save_settings(self.settings)
+
+def _on_close(self):
+    self._save_col_widths()
+    self.destroy()
+```
+
+`_save_col_widths` is called:
+- After `_autofit_path_columns` runs (post-scan)
+- On every `<ButtonRelease-1>` on the treeview header (user finished dragging a
+  column divider)
+- In `_on_close` just before the window is destroyed
+
+`_on_close` is registered as the `WM_DELETE_WINDOW` protocol handler in
+`__init__`. Without this, clicking the window's X button would call tkinter's
+default destroy immediately — before `_save_col_widths` had a chance to run.
+
+On startup, `_build_scan_page` reads the saved widths back:
+
+```python
+saved_widths = self.settings.get("col_widths", {})
+w = saved_widths.get(col_id, default_w)
+self.tree.column(col_id, width=w, ...)
+```
+
 ---
 
-## 13. Find and Replace
+## 14. Find and Replace
 
 ### `_compile_find()`
 
@@ -706,47 +866,55 @@ filtering).
 
 ### `_bulk_replace()`
 
-The "Apply to visible" button calls this. It processes every visible row and
-updates `row["new"]` in-place:
+The "Apply to visible" button calls this. After reading the find/replace
+strings and mode flags from the UI, it delegates all per-row work to the
+module-level `apply_replacement` function:
 
 ```python
-repl = self.replace_var.get()
+# Validate pattern and replacement before touching any rows.
+try:
+    apply_replacement(find, repl, "", regex=use_regex, case=case)
+except re.error as e:
+    self.regex_status.set(f"Invalid pattern/replacement: {e}")
+    return
 
-if use_regex:
-    # Normalise $1/$2 backreferences to Python's \1/\2 syntax
-    repl = re.sub(r'\$\{(\d+)\}',          r'\\g<\1>', repl)
-    repl = re.sub(r'\$\{([A-Za-z_]\w*)\}', r'\\g<\1>', repl)
-    repl = re.sub(r'\$(\d+)',              r'\\\1',     repl)
-
-    # Validate before touching any rows
-    try:
-        pat.sub(repl, "")
-    except re.error as e:
-        self.regex_status.set(f"Invalid replacement: {e}")
-        return
-    ...
+for rid in self.tree.get_children():
+    row = self.rows[rid]
+    updated, changed = apply_replacement(find, repl, row["new"],
+                                         regex=use_regex, case=case)
+    if changed:
+        row["new"] = updated
+        n += 1
 ```
 
-**Why `$1` → `\1` conversion?** Python's `re.sub` uses `\1`, `\2` for captured
-groups. Most other tools (JavaScript, grep, sed) use `$1`, `$2`. The
-normalisation step means both styles work transparently.
-
-For the case-insensitive literal replacement path:
-```python
-updated, k = _case_pat.subn(lambda m: repl, new)
-```
-
-Using a **lambda** (an inline function) as the replacement argument instead of
-a string tells `re.subn` to use the return value literally — no backslash
-processing. This prevents Windows paths like `C:\new\folder` in the Replace
-field from having `\n` and `\f` silently expanded as escape sequences.
+The trial call on an empty string validates both the pattern and the
+replacement in one step before any row is touched. The actual logic — backreference
+normalisation, lambda trick for backslash safety, regex vs. literal branching —
+all lives in `apply_replacement`. See [Pure logic helpers](#9-pure-logic-helpers)
+for the full explanation.
 
 ---
 
-## 14. Apply Renames
+## 15. Apply Renames
 
-`_apply_renames()` is the most complex part of the app. It takes the list of
-`(original path, new path)` pairs from all edited rows and applies them safely.
+`_apply_renames()` validates the edits, sorts the mapping by path depth
+(parents first), then spawns a background thread that delegates all renaming
+work to the module-level `rename_segment_walk` function:
+
+```python
+mapping = sorted(((r["orig"], r["new"]) for r in edits),
+                 key=lambda kv: (kv[0].count(os.sep), kv[0]))
+
+def worker():
+    ok, fail, _ = rename_segment_walk(mapping, rename_path, self._log)
+    self._log(f"--- renames done: {ok} ok, {fail} failed ---")
+    self.after(0, self._after_apply)
+
+threading.Thread(target=worker, daemon=True).start()
+```
+
+After all renames complete, `_after_apply()` re-enables the button and
+triggers a fresh scan so the table reflects the new state of the filesystem.
 
 ### Why not just rename each row directly?
 
@@ -761,7 +929,8 @@ If you rename `A\B\C\D` first, the path `A\B\C\D\E\F\G` no longer exists —
 Windows moved everything inside `C\D` to `CC\DD`. You'd need to update the
 second path to `A\B\CC\DD\E\F\GG` before you can rename it.
 
-The solution is to rename **one path segment at a time, left to right**:
+The solution — implemented in `rename_segment_walk` — is to rename **one path
+segment at a time, left to right**:
 
 ```
 Step 1:  A\B\C        →  A\B\CC          (rename just the C segment)
@@ -769,54 +938,66 @@ Step 2:  A\B\CC\D     →  A\B\CC\DD       (rename just the D segment)
 Step 3:  A\B\CC\DD\E\F\G  →  A\B\CC\DD\E\F\GG  (rename just the G segment)
 ```
 
-### `done_renames` dictionary
+The `done_renames` dict inside `rename_segment_walk` serves two purposes:
 
-```python
-done_renames: dict[str, str] = {}   # maps "original path" → "renamed path"
-```
-
-Serves two jobs:
-
-1. **Deduplication** — when multiple rows share the same parent (e.g. 500
-   files all in `C:\LongName`), the parent rename `C:\LongName → C:\Short`
-   only fires once. Sibling rows skip it when they see it's already in
-   `done_renames`.
+1. **Deduplication** — when multiple rows share the same parent, the parent
+   rename fires exactly once; sibling rows skip it via the dict lookup.
 
 2. **Path reconciliation** — a later row's `new` path might refer to a segment
-   that was already renamed by an earlier row. The lookup corrects both the
-   "current" path (`cur_parts`) and the "intended new" path (`new_parts`)
-   before each step so everything routes through the latest actual names.
+   already renamed by an earlier row. The lookup corrects both `cur_parts` and
+   `new_parts` before each step so everything routes through the latest names.
 
-### The segment loop
-
-```python
-for i in range(len(orig_parts)):
-    src_seg = os.sep.join(cur_parts[:i + 1])   # e.g. "A\B\C" at step i=2
-
-    if src_seg in done_renames:
-        actual_dst  = done_renames[src_seg]
-        actual_name = actual_dst.rsplit(os.sep, 1)[-1]
-        cur_parts[i] = actual_name
-        if new_parts[i] == orig_parts[i]:      # user didn't intend to rename this segment
-            new_parts[i] = actual_name         # so update it to the actual current name
-        src_seg = actual_dst
-
-    if cur_parts[i] == new_parts[i]:
-        continue                                # this segment hasn't changed, skip
-
-    # This segment IS changing — do the rename
-    cur_parts[i] = new_parts[i]
-    dst_seg = os.sep.join(cur_parts[:i + 1])
-    rename_path(src_seg, dst_seg)
-    done_renames[src_seg] = dst_seg
-```
-
-After all renames complete, `_after_apply()` triggers a fresh scan so the
-table reflects the new state of the filesystem.
+Because the algorithm is extracted into `rename_segment_walk`, all of this
+logic is covered by unit tests in `test_logic.py` without touching the filesystem.
 
 ---
 
-## 15. Settings modal
+## 16. Logs tab
+
+The Logs tab (`_build_log_page`) holds the activity log and the error log on a
+dedicated full-page view, replacing the cramped strip that was pinned to the
+bottom of the main area in v1.0.
+
+### Layout
+
+```
+Logs page (ttk.Frame, fills the pages host)
+├── Activity log section (expands to fill available height)
+│     ├── tk.Text (wraps=NONE, xscrollcommand, yscrollcommand)
+│     ├── Vertical scrollbar (right side)
+│     └── Horizontal scrollbar (bottom)
+├── Separator (hairline divider between the two sections)
+└── Error log section (fixed height, pinned at bottom)
+      ├── Label: "Error log"
+      ├── tk.Text (wraps=NONE)
+      └── Horizontal scrollbar
+```
+
+Both text widgets use `wrap=tk.NONE` so long lines extend horizontally rather
+than word-wrapping — paths are often wider than the window and must be readable
+in full.
+
+### Unread badge
+
+`_drain_log` is called by a periodic `self.after(200, _drain_log)` timer on
+the main thread. It reads every pending message from `self._log_q` (written by
+background worker threads) and appends them to the activity log text widget.
+
+```python
+# inside _drain_log, after appending each message:
+if self.current_page != "logs":
+    self._log_unread += 1
+    self._update_log_badge()
+```
+
+Because the user can't see the Logs tab when they're on the Scan or Transfer
+page, every new message increments `_log_unread` and triggers a badge update.
+The badge text `"📋  Logs  (3)"` appears on the nav button so the user knows
+something happened without needing to switch tabs.
+
+---
+
+## 17. Settings modal
 
 The settings window is a `tk.Toplevel` (a child window) containing a
 `ttk.Notebook` with four tabs:
@@ -847,7 +1028,7 @@ Displays version, platform, and the path to `settings.json`.
 
 ---
 
-## 16. Entry point
+## 18. Entry point
 
 ```python
 def main():
