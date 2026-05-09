@@ -21,6 +21,7 @@ import threading
 import datetime
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from ctypes import wintypes
 from tkinter import filedialog, messagebox, ttk
 
@@ -452,6 +453,8 @@ DEFAULT_SETTINGS = {
     "sans_family":     "Segoe UI",
     "mono_family":     "Cascadia Mono",
     "visible_cols":    ["len", "newlen", "kind", "orig", "new"],
+    "col_widths":      {"len": 80, "newlen": 100, "kind": 64, "orig": 600, "new": 600},
+    "last_root":       "",
 }
 
 # All data files live beside the script — fully portable.
@@ -794,6 +797,115 @@ def apply_theme(root: tk.Tk, theme_name: str, accent_name: str = "transfer",
 
 
 # =============================================================================
+# pure logic helpers (module-level so unit tests can import them directly)
+# =============================================================================
+
+def normalise_replacement(repl: str) -> str:
+    r"""Convert $1 / ${1} / ${name} backreference syntax to Python's \1 / \g<1> / \g<name>."""
+    repl = re.sub(r'\$\{(\d+)\}',          r'\\g<\1>', repl)
+    repl = re.sub(r'\$\{([A-Za-z_]\w*)\}', r'\\g<\1>', repl)
+    repl = re.sub(r'\$(\d+)',              r'\\\1',     repl)
+    return repl
+
+
+def apply_replacement(find: str, repl: str, text: str, *, regex: bool, case: bool) -> tuple[str, bool]:
+    """Apply one find/replace operation to a single path string.
+
+    Returns (result, changed).  Raises re.error for invalid patterns/replacements.
+    re.compile results are cached by the stdlib so calling this in a tight loop
+    with the same find+flags is not expensive.
+    """
+    if regex:
+        flags = 0 if case else re.IGNORECASE
+        pat = re.compile(find, flags)
+        repl_norm = normalise_replacement(repl)
+        result, k = pat.subn(repl_norm, text)
+        return result, k > 0
+    else:
+        if case:
+            changed = find in text
+            return (text.replace(find, repl) if changed else text), changed
+        else:
+            # Lambda prevents backslashes in repl (e.g. C:\new\folder) from
+            # being expanded as regex escape sequences by subn.
+            pat = re.compile(re.escape(find), re.IGNORECASE)
+            result, k = pat.subn(lambda m: repl, text)
+            return result, k > 0
+
+
+def rename_segment_walk(
+    mapping: list[tuple[str, str]],
+    rename_fn,          # callable(src, dst) — raises on failure
+    log_fn=None,        # callable(msg) — optional
+) -> tuple[int, int, dict[str, str]]:
+    """Rename a list of (orig, new) path pairs one segment at a time.
+
+    Sorting by depth is the caller's responsibility (App._apply_renames does
+    this before spawning the thread).  Returns (ok, fail, done_renames) where
+    done_renames maps every src segment path to its final dst path.
+
+    Key properties:
+    • Parents are renamed before their children.
+    • A shared parent rename fires exactly once even when many sibling rows
+      share the same change (deduplication via done_renames).
+    • If row B's new-path was computed before row A's rename was applied, the
+      walk reconciles B's path through the updated segment names (cross-row
+      reconciliation).
+    """
+    sep = os.sep
+    done_renames: dict[str, str] = {}
+    ok = fail = 0
+
+    for orig, new in mapping:
+        orig_parts = orig.split(sep)
+        new_parts  = list(new.split(sep))
+
+        if len(orig_parts) != len(new_parts):
+            if log_fn:
+                log_fn(f"FAIL: path depth changed (not a rename): {orig}  ->  {new}")
+            fail += 1
+            continue
+
+        cur_parts = list(orig_parts)
+
+        for i in range(len(orig_parts)):
+            op      = orig_parts[i]
+            src_seg = sep.join(cur_parts[:i + 1])
+
+            if src_seg in done_renames:
+                actual_dst  = done_renames[src_seg]
+                actual_name = actual_dst.rsplit(sep, 1)[-1]
+                cur_parts[i] = actual_name
+                if new_parts[i] == op:
+                    new_parts[i] = actual_name
+                src_seg = actual_dst
+
+            np = new_parts[i]
+            if cur_parts[i] == np:
+                continue
+
+            cur_parts[i] = np
+            dst_seg = sep.join(cur_parts[:i + 1])
+
+            if done_renames.get(src_seg) == dst_seg:
+                continue
+
+            try:
+                rename_fn(src_seg, dst_seg)
+                done_renames[src_seg] = dst_seg
+                if log_fn:
+                    log_fn(f"renamed: {src_seg}  ->  {dst_seg}")
+                ok += 1
+            except Exception as e:
+                if log_fn:
+                    log_fn(f"FAIL: {src_seg}  ->  {dst_seg}  ::  {e}")
+                fail += 1
+                break
+
+    return ok, fail, done_renames
+
+
+# =============================================================================
 # app
 # =============================================================================
 
@@ -817,6 +929,7 @@ class App(tk.Tk):
         self._scan_cancel = False
         self._sort_state = {"col": "len", "desc": True}
         self._text_widgets: list[tk.Text] = []
+        self._log_unread = 0
 
         # created lazily by _build_main_pages
         self.pages: dict[str, ttk.Frame] = {}
@@ -826,6 +939,7 @@ class App(tk.Tk):
         self.sb_mode = tk.StringVar(value="SCAN · IDLE")
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(50, lambda: apply_window_chrome(self, self.theme))
         self.after(80, self._drain_log)
 
@@ -852,6 +966,9 @@ class App(tk.Tk):
         if name == self.current_page:
             return
         self.current_page = name
+        if name == "logs":
+            self._log_unread = 0
+            self._update_log_badge()
         self._reapply_theme()
         for key, btn in self.nav_buttons.items():
             btn.configure(style="NavActive.TButton" if key == name else "Nav.TButton")
@@ -861,6 +978,12 @@ class App(tk.Tk):
             else:
                 frame.pack_forget()
         self._update_statusbar()
+
+    def _update_log_badge(self):
+        if "logs" not in self.nav_buttons:
+            return
+        label = "📋  Logs" if self._log_unread == 0 else f"📋  Logs  ({self._log_unread})"
+        self.nav_buttons["logs"].configure(text=label)
 
     def _restyle_raw_widgets(self):
         c = self.C
@@ -894,6 +1017,54 @@ class App(tk.Tk):
         # Re-apply column visibility after any tree restyle
         if hasattr(self, "tree"):
             self._apply_column_visibility()
+
+    def _save_col_widths(self, _=None):
+        if not hasattr(self, "tree"):
+            return
+        widths = {}
+        for col_id in ("len", "newlen", "kind", "orig", "new"):
+            try:
+                widths[col_id] = self.tree.column(col_id, "width")
+            except tk.TclError:
+                pass
+        self.settings["col_widths"] = widths
+        save_settings(self.settings)
+
+    def _autofit_path_columns(self):
+        """Widen orig/new columns to fit the longest visible path.
+        Uses heapq to find the top-N widest paths by character count, then
+        measures only those — O(n) scan + O(1) fnt.measure calls regardless
+        of row count, so it stays fast even on hundreds-of-thousands scans."""
+        if not hasattr(self, "tree") or not self.rows:
+            return
+        import heapq
+        fam, sz = self._f["sans"][0], self._f["sans"][1]
+        fnt = tkfont.Font(family=fam, size=sz)
+
+        split = bool(self.split_fields.get())
+        sep_char = "  ›  " if split else "＼"
+        pad = 24
+
+        # Cheaply find the 5 rows with the longest orig/new paths (by char count).
+        # Measuring pixel width of 10 strings is negligible; measuring 300k is not.
+        top_orig = heapq.nlargest(5, self.rows.values(), key=lambda r: len(r["orig"]))
+        top_new  = heapq.nlargest(5, self.rows.values(), key=lambda r: len(r["new"]))
+
+        max_orig_px = max((fnt.measure(r["orig"].replace("\\", sep_char)) for r in top_orig), default=0)
+        max_new_px  = max((fnt.measure(r["new"].replace("\\",  sep_char)) for r in top_new),  default=0)
+
+        heading_min = fnt.measure("ORIGINAL PATH") + pad
+        for col_id, measured in (("orig", max_orig_px), ("new", max_new_px)):
+            width = max(heading_min, measured + pad)
+            try:
+                self.tree.column(col_id, width=width)
+            except tk.TclError:
+                pass
+        self._save_col_widths()
+
+    def _on_close(self):
+        self._save_col_widths()
+        self.destroy()
 
     # ---- logo ----------------------------------------------------------------
 
@@ -962,6 +1133,7 @@ class App(tk.Tk):
 
         add_nav("scan",     "🔍  Scan & Rename")
         add_nav("transfer", "📦  Transfer")
+        add_nav("logs",     "📋  Logs")
 
         # Right: settings + theme
         right = ttk.Frame(bar, style="Titlebar.TFrame")
@@ -975,17 +1147,15 @@ class App(tk.Tk):
             side="right", padx=(0, 6), pady=5)
 
     def _build_main_pages(self, main):
-        # Log pinned to the bottom of main so it never gets pushed off-screen;
-        # pages above it fill the remaining space and scroll internally.
-        self._build_log(main)
-
         pages_host = ttk.Frame(main)
-        pages_host.pack(side="top", fill="both", expand=True)
+        pages_host.pack(fill="both", expand=True)
 
         page_transfer = ttk.Frame(pages_host)
         page_scan = ttk.Frame(pages_host)
+        page_logs = ttk.Frame(pages_host)
         self.pages["transfer"] = page_transfer
         self.pages["scan"] = page_scan
+        self.pages["logs"] = page_logs
 
         # Transfer page: short, scrollable wrapper — if the window shrinks
         # we still want the controls reachable.
@@ -998,6 +1168,8 @@ class App(tk.Tk):
         # height and left the rest of the window blank. Building directly
         # into page_scan lets the table fill all available vertical space.
         self._build_scan_page(page_scan)
+
+        self._build_log_page(page_logs)
 
         # Show initial page — Scan & Rename is the default
         page_scan.pack(fill="both", expand=True)
@@ -1059,54 +1231,70 @@ class App(tk.Tk):
         for child in widget.winfo_children():
             yield from App._walk(child)
 
-    def _build_log(self, main):
-        # Two-row log strip pinned to the bottom of the main area.
-        #
-        # Row 1 — ACTIVITY LOG: every message auto-saved to activity_log.txt.
-        #   [Clear log] wipes both the widget and the file.
-        #
-        # Row 2 — ERROR LOG: error/fail messages only, auto-saved to
-        #   error_log.txt.  [Clear errors] wipes widget + file.
+    def _build_log_page(self, page):
         c = self.C
-        ttk.Separator(main).pack(fill="x")
-        log_wrap = ttk.Frame(main)
-        log_wrap.pack(fill="x")
+        inner = ttk.Frame(page)
+        inner.pack(fill="both", expand=True, padx=28, pady=16)
 
-        # ── Activity log bar ──────────────────────────────────────────────
-        act_bar = ttk.Frame(log_wrap)
-        act_bar.pack(fill="x", padx=18, pady=(4, 1))
-        ttk.Label(act_bar, text="ACTIVITY LOG", style="Field.TLabel").pack(side="left")
-        ttk.Label(act_bar, text=f"  → {ACTIVITY_LOG_FILE}",
-                  style="Muted.TLabel", font=self._f["mono_sm"]).pack(side="left")
-        ttk.Button(act_bar, text="Clear log", style="TButton",
-                   command=self._clear_log).pack(side="right")
+        ttk.Label(inner, text="Logs", style="H1.TLabel").pack(anchor="w", pady=(0, 12))
 
-        self.log = tk.Text(log_wrap, height=3, wrap="none", state="disabled",
-                           bg=c["bg_code"], fg=c["text_sec"],
-                           insertbackground=c["text"],
-                           relief="flat", borderwidth=0, highlightthickness=0,
-                           font=self._f["mono_sm"], padx=12, pady=4)
-        self.log.pack(fill="x", padx=18, pady=(0, 4))
-        self.log.tag_configure("err", foreground=c["danger"])
-        self.log.tag_configure("ok", foreground=c["ok"])
-        self.log.tag_configure("dim", foreground=c["text_muted"])
+        # ── Error log — bottom section ────────────────────────────────────
+        # With side="bottom", each successive pack() lands ABOVE the previous.
+        # To render [separator][label bar][text] top-to-bottom, pack in
+        # reverse: text first (very bottom), then label bar, then separator.
+        err_wrap = ttk.Frame(inner)
+        err_wrap.pack(side="bottom", fill="x")
+        err_wrap.columnconfigure(0, weight=1)
 
-        # ── Error log bar ─────────────────────────────────────────────────
-        ttk.Separator(log_wrap).pack(fill="x", padx=18)
-        err_bar = ttk.Frame(log_wrap)
-        err_bar.pack(fill="x", padx=18, pady=(3, 1))
+        self.err_log = tk.Text(err_wrap, height=4, wrap="none", state="disabled",
+                               bg=c["bg_code"], fg=c["danger"],
+                               insertbackground=c["text"],
+                               relief="flat", borderwidth=0, highlightthickness=0,
+                               font=self._f["mono_sm"], padx=12, pady=4)
+        err_xsb = ttk.Scrollbar(err_wrap, orient="horizontal", command=self.err_log.xview)
+        self.err_log.configure(xscrollcommand=err_xsb.set)
+        self.err_log.grid(row=1, column=0, sticky="ew")
+        err_xsb.grid(row=2, column=0, sticky="ew")
+
+        err_bar = ttk.Frame(err_wrap)
+        err_bar.grid(row=0, column=0, sticky="ew", pady=(6, 2))
         ttk.Label(err_bar, text="ERROR LOG", style="Field.TLabel").pack(side="left")
         ttk.Label(err_bar, text=f"  → {ERROR_LOG_FILE}",
                   style="Muted.TLabel", font=self._f["mono_sm"]).pack(side="left")
         ttk.Button(err_bar, text="Clear errors", style="TButton",
                    command=self._clear_error_log).pack(side="right")
 
-        self.err_log = tk.Text(log_wrap, height=2, wrap="none", state="disabled",
-                               bg=c["bg_code"], fg=c["danger"],
-                               insertbackground=c["text"],
-                               relief="flat", borderwidth=0, highlightthickness=0,
-                               font=self._f["mono_sm"], padx=12, pady=4)
-        self.err_log.pack(fill="x", padx=18, pady=(0, 6))
+        ttk.Separator(inner).pack(side="bottom", fill="x", pady=(8, 0))
+
+        # ── Activity log — fills remaining space ──────────────────────────
+        act_bar = ttk.Frame(inner)
+        act_bar.pack(fill="x", pady=(0, 4))
+        ttk.Label(act_bar, text="ACTIVITY LOG", style="Field.TLabel").pack(side="left")
+        ttk.Label(act_bar, text=f"  → {ACTIVITY_LOG_FILE}",
+                  style="Muted.TLabel", font=self._f["mono_sm"]).pack(side="left")
+        ttk.Button(act_bar, text="Clear log", style="TButton",
+                   command=self._clear_log).pack(side="right")
+
+        log_wrap = ttk.Frame(inner)
+        log_wrap.pack(fill="both", expand=True)
+        log_wrap.rowconfigure(0, weight=1)
+        log_wrap.columnconfigure(0, weight=1)
+
+        self.log = tk.Text(log_wrap, wrap="none", state="disabled",
+                           bg=c["bg_code"], fg=c["text_sec"],
+                           insertbackground=c["text"],
+                           relief="flat", borderwidth=0, highlightthickness=0,
+                           font=self._f["mono_sm"], padx=12, pady=4)
+        log_vsb = ttk.Scrollbar(log_wrap, orient="vertical",   command=self.log.yview)
+        log_xsb = ttk.Scrollbar(log_wrap, orient="horizontal", command=self.log.xview)
+        self.log.configure(yscrollcommand=log_vsb.set, xscrollcommand=log_xsb.set)
+        self.log.grid(row=0, column=0, sticky="nsew")
+        log_vsb.grid(row=0, column=1, sticky="ns")
+        log_xsb.grid(row=1, column=0, sticky="ew")
+
+        self.log.tag_configure("err", foreground=c["danger"])
+        self.log.tag_configure("ok",  foreground=c["ok"])
+        self.log.tag_configure("dim", foreground=c["text_muted"])
 
     def _build_statusbar(self):
         sb = ttk.Frame(self, style="Statusbar.TFrame")
@@ -1208,13 +1396,13 @@ class App(tk.Tk):
     def _build_scan_page(self, page):
         c = self.C
         inner = ttk.Frame(page)
-        inner.pack(fill="both", expand=True, padx=28, pady=20)
+        inner.pack(fill="both", expand=True, padx=28, pady=12)
 
         # Root selector line
         ttk.Label(inner, text="ROOT", style="Field.TLabel").pack(anchor="w", pady=(0, 4))
         line1 = ttk.Frame(inner)
         line1.pack(fill="x")
-        self.root_var = tk.StringVar()
+        self.root_var = tk.StringVar(value=self.settings.get("last_root", ""))
         ttk.Entry(line1, textvariable=self.root_var, font=self._f["mono"]).pack(
             side="left", fill="x", expand=True)
         ttk.Button(line1, text="Browse…", command=self._pick_root).pack(side="left", padx=(6, 0))
@@ -1227,7 +1415,7 @@ class App(tk.Tk):
 
         # Progress + status
         prog = ttk.Frame(inner)
-        prog.pack(fill="x", pady=(10, 0))
+        prog.pack(fill="x", pady=(6, 0))
         self.scan_progress = ttk.Progressbar(prog, mode="indeterminate", length=260)
         self.scan_progress.pack(side="left")
         self.scan_status = tk.StringVar(value="Idle.")
@@ -1237,7 +1425,7 @@ class App(tk.Tk):
         # Filters — all on one row: MIN LENGTH + folder/file kind toggles.
         # Used to be three vertical lines (label / spinbox / kinds), which
         # was pure waste; one inline strip saves two rows for the table.
-        ttk.Separator(inner).pack(fill="x", pady=10)
+        ttk.Separator(inner).pack(fill="x", pady=(8, 6))
 
         frow = ttk.Frame(inner)
         frow.pack(fill="x")
@@ -1289,13 +1477,17 @@ class App(tk.Tk):
         # inside a cell, so this is the closest "make \ bold" we can get
         # without reimplementing the row renderer on a Canvas.
         self.split_fields = tk.BooleanVar(value=False)
+        def _on_split_toggle():
+            self._refresh_view()
+            self._autofit_path_columns()
+
         ttk.Checkbutton(frow,
                         text="Split path  (A › B › C vs A＼b)",
                         variable=self.split_fields,
-                        command=self._refresh_view).pack(side="left", padx=(14, 0))
+                        command=_on_split_toggle).pack(side="left", padx=(14, 0))
 
         # Find/replace
-        ttk.Separator(inner).pack(fill="x", pady=16)
+        ttk.Separator(inner).pack(fill="x", pady=(10, 8))
         fr = ttk.Frame(inner)
         fr.pack(fill="x")
         ttk.Label(fr, text="FIND", style="Field.TLabel").grid(row=0, column=0, sticky="w")
@@ -1330,12 +1522,25 @@ class App(tk.Tk):
 
         self.regex_status = tk.StringVar(value="")
         ttk.Label(inner, textvariable=self.regex_status,
-                  style="Warn.TLabel", font=self._f["mono_sm"]).pack(anchor="w", pady=(4, 0))
+                  style="Warn.TLabel", font=self._f["mono_sm"]).pack(anchor="w", pady=(2, 0))
 
-        # Table
+        # Bottom actions — pack side="bottom" FIRST so table_wrap never overlaps it
+        bar = ttk.Frame(inner)
+        bar.pack(side="bottom", fill="x", pady=(8, 0))
+        self.scan_summary = tk.StringVar(value="No scan yet.")
+        ttk.Label(bar, textvariable=self.scan_summary,
+                  style="Sec.TLabel", font=self._f["mono_sm"]).pack(side="left")
+        self.btn_apply = ttk.Button(bar, text="Apply renames", style="Primary.TButton",
+                                    command=self._apply_renames)
+        self.btn_apply.pack(side="right")
+        ttk.Button(bar, text="Reset edits", command=self._reset_edits).pack(
+            side="right", padx=(0, 8))
+
+        # Table — fills remaining space between controls above and bar below
         table_wrap = ttk.Frame(inner)
-        table_wrap.pack(fill="both", expand=True, pady=(12, 0))
+        table_wrap.pack(fill="both", expand=True, pady=(8, 0))
 
+        saved_widths = self.settings.get("col_widths", DEFAULT_SETTINGS["col_widths"])
         cols = ("len", "newlen", "kind", "orig", "new")
         tree = ttk.Treeview(table_wrap, columns=cols, show="headings", selectmode="extended")
         # Path columns are intentionally wide (600 px each) so their total
@@ -1343,13 +1548,14 @@ class App(tk.Tk):
         # horizontal scrollbar functional.  stretch=False on every column
         # prevents tkinter from expanding them to fit the widget (which
         # would eliminate the overflow and break xview scrolling).
-        for col_id, title, w, anchor in [
+        for col_id, title, default_w, anchor in [
             ("len",    "LENGTH",                           80, "e"),
             ("newlen", "NEW LENGTH",                      100, "e"),
             ("kind",   "KIND",                             64, "center"),
             ("orig",   "ORIGINAL PATH",                   600, "w"),
             ("new",    "NEW PATH  (double-click to edit)",600, "w"),
         ]:
+            w = saved_widths.get(col_id, default_w)
             tree.heading(col_id, text=title, command=lambda cc=col_id: self._sort_by(cc))
             tree.column(col_id, width=w, anchor=anchor, stretch=False)
 
@@ -1366,20 +1572,9 @@ class App(tk.Tk):
         tree.tag_configure("over260", foreground="#b91c1c")
         tree.tag_configure("over260_changed", background=c["over260"], foreground="#b91c1c")
         tree.bind("<Double-1>", self._on_double_click)
+        tree.bind("<ButtonRelease-1>", self._save_col_widths)
         self.tree = tree
         self._apply_column_visibility()
-
-        # Bottom actions
-        bar = ttk.Frame(inner)
-        bar.pack(fill="x", pady=(12, 0))
-        self.scan_summary = tk.StringVar(value="No scan yet.")
-        ttk.Label(bar, textvariable=self.scan_summary,
-                  style="Sec.TLabel", font=self._f["mono_sm"]).pack(side="left")
-        self.btn_apply = ttk.Button(bar, text="Apply renames", style="Primary.TButton",
-                                    command=self._apply_renames)
-        self.btn_apply.pack(side="right")
-        ttk.Button(bar, text="Reset edits", command=self._reset_edits).pack(
-            side="right", padx=(0, 8))
 
     # ---- log ------------------------------------------------------------------
 
@@ -1409,6 +1604,10 @@ class App(tk.Tk):
                 self.log.see("end")
                 self.log.configure(state="disabled")
                 self._append_to_file(ACTIVITY_LOG_FILE, msg)
+
+                if self.current_page != "logs":
+                    self._log_unread += 1
+                    self._update_log_badge()
 
                 # Error log widget + file (errors only)
                 if is_err and hasattr(self, "err_log"):
@@ -1550,6 +1749,9 @@ class App(tk.Tk):
             messagebox.showerror("Bad root", "Pick an existing folder.")
             return
 
+        self.settings["last_root"] = root
+        save_settings(self.settings)
+
         self._busy = True
         self._scan_cancel = False
         self.btn_scan.state(["disabled"])
@@ -1586,6 +1788,7 @@ class App(tk.Tk):
                         self._busy = False
                         self._update_statusbar(state="● idle", info=f"{total:,} items scanned")
                         self._refresh_view()
+                        self._autofit_path_columns()
                         return
                     elif kind == "err":
                         self._log(f"Scan error: {rest[0]}")
@@ -1767,29 +1970,39 @@ class App(tk.Tk):
             return
         x, y, w, h = bbox
 
-        # Use a raw tk.Entry rather than ttk.Entry: ttk's themed padding
-        # eats vertical space and clips text top/bottom inside a tight row
-        # bbox. tk.Entry with bd=0 + matching font + a 1-px bleed above
-        # and below shows the glyph cell intact.
+        # Popup editor: Entry + horizontal scrollbar in a frame that spans
+        # the full treeview width so long paths can be scrolled just like
+        # the activity log.  The frame is placed at the row's y-position;
+        # the extra scrollbar height is added below the row.
         c = self.C
-        entry = tk.Entry(
+        tree_w = self.tree.winfo_width()
+
+        popup = tk.Frame(
             self.tree,
+            bg=c.get("border", "#ccc"),
+            bd=0, highlightthickness=0,
+        )
+        entry = tk.Entry(
+            popup,
             font=self._f["sans"],
             bd=0,
             relief="flat",
-            highlightthickness=1,
-            highlightcolor=c.get("text", "#000"),
-            highlightbackground=c.get("border", "#ccc"),
+            highlightthickness=0,
             bg=c.get("bg_surface", "#fff"),
             fg=c.get("text", "#000"),
             insertbackground=c.get("text", "#000"),
         )
+        xsb = ttk.Scrollbar(popup, orient="horizontal", command=entry.xview)
+        entry.configure(xscrollcommand=xsb.set)
+        entry.pack(fill="x", ipady=1)
+        xsb.pack(fill="x")
+
+        sb_h = xsb.winfo_reqheight() or 14
+        popup.place(x=0, y=y - 1, width=tree_w, height=h + sb_h + 2)
+
         entry.insert(0, self.rows[rid]["new"])
         entry.select_range(0, "end")
         entry.focus_set()
-        # Bleed by 1 px on top/bottom so the ascender/descender of the
-        # font glyph isn't clipped by the row's tight bbox.
-        entry.place(x=x, y=y - 1, width=w, height=h + 2)
 
         _committed = [False]
 
@@ -1798,13 +2011,13 @@ class App(tk.Tk):
                 return
             _committed[0] = True
             val = entry.get()
-            entry.destroy()
+            popup.destroy()
             self.rows[rid]["new"] = val
             self._refresh_view()
 
         def cancel(_=None):
             _committed[0] = True
-            entry.destroy()
+            popup.destroy()
 
         entry.bind("<Return>", commit)
         entry.bind("<FocusOut>", commit)
@@ -1818,59 +2031,22 @@ class App(tk.Tk):
         use_regex = self.regex_on.get()
         case = self.case_sensitive.get()
 
-        if use_regex:
-            try:
-                pat = re.compile(find, 0 if case else re.IGNORECASE)
-            except re.error as e:
-                self.regex_status.set(f"Invalid regex: {e}")
-                return
-            # Normalise replacement: convert $1/$2/… and ${1}/${name} to the
-            # \1/\g<1>/\g<name> syntax that Python's re module expects, so
-            # users can write either convention.
-            repl = re.sub(r'\$\{(\d+)\}', r'\\g<\1>', repl)
-            repl = re.sub(r'\$\{([A-Za-z_]\w*)\}', r'\\g<\1>', repl)
-            repl = re.sub(r'\$(\d+)', r'\\\1', repl)
-            # Validate the replacement string early (e.g. \1 with no group)
-            # by doing a no-op trial sub before touching any rows.
-            try:
-                pat.sub(repl, "")
-            except re.error as e:
-                self.regex_status.set(f"Invalid replacement: {e}")
-                return
-        else:
-            pat = None
-            if not case:
-                # Compile the escaped literal pattern once, outside the loop.
-                _case_pat = re.compile(re.escape(find), re.IGNORECASE)
+        # Validate pattern and replacement before touching any rows.
+        try:
+            apply_replacement(find, repl, "", regex=use_regex, case=case)
+        except re.error as e:
+            self.regex_status.set(f"Invalid pattern/replacement: {e}")
+            return
 
         visible = self.tree.get_children()
         n = 0
         for rid in visible:
             row = self.rows[rid]
-            new = row["new"]
-            if use_regex:
-                try:
-                    updated, k = pat.subn(repl, new)
-                except re.error as e:
-                    self.regex_status.set(f"Invalid replacement: {e}")
-                    return
-                if k:
-                    row["new"] = updated
-                    n += 1
-            else:
-                if case:
-                    if find in new:
-                        row["new"] = new.replace(find, repl)
-                        n += 1
-                else:
-                    # Use a lambda so `repl` is treated as a literal string —
-                    # prevents backslashes in the replacement (e.g. Windows
-                    # paths like C:\new\folder) from being interpreted as
-                    # regex escape sequences by re.subn.
-                    updated, k = _case_pat.subn(lambda m: repl, new)
-                    if k:
-                        row["new"] = updated
-                        n += 1
+            updated, changed = apply_replacement(find, repl, row["new"],
+                                                 regex=use_regex, case=case)
+            if changed:
+                row["new"] = updated
+                n += 1
         self._log(f"Find/replace touched {n} visible row(s).")
         self._refresh_view()
 
@@ -1911,93 +2087,7 @@ class App(tk.Tk):
                          key=lambda kv: (kv[0].count(os.sep), kv[0]))
 
         def worker():
-            # Rename each path one segment at a time, left to right.
-            #
-            # For a row like  A\B\C\D\E\F\G  ->  A\B\CC\DD\E\F\GG  we emit
-            # three physical renames in order:
-            #   1. A\B\C        ->  A\B\CC
-            #   2. A\B\CC\D     ->  A\B\CC\DD
-            #   3. A\B\CC\DD\E\F\G  ->  A\B\CC\DD\E\F\GG
-            #
-            # This is safe even when intermediate directories are NOT in
-            # `mapping` (e.g. the user edited only a leaf row): we discover
-            # and rename them on the way down.
-            #
-            # done_renames  (src_path -> dst_path)  serves two purposes:
-            #
-            #   1. Deduplication — when a bulk find/replace puts every item
-            #      under the same dirs into `mapping`, the shared parent rename
-            #      only fires once; sibling rows skip it via the dict lookup.
-            #
-            #   2. Path reconciliation — a later row may have a `new` path that
-            #      was computed before an earlier row's rename was known.
-            #      Example:
-            #        row A:  A\B\C\D\E        ->  A\B\C\D\EE   (E renamed)
-            #        row B:  A\B\C\D\E\F\G    ->  A\B\C\D\E\FF\G  (F renamed,
-            #                                     but new still says E not EE)
-            #      Before comparing segment i, we check whether that prefix
-            #      path was already renamed and, if so, update both cur_parts
-            #      and new_parts to route through the new name.  This
-            #      naturally handles chains (C->CC, then CC->CCC) because
-            #      cur_parts is rebuilt from scratch at each segment.
-            #
-            # Because each individual rename moves exactly one path segment,
-            # make_dir is never needed — the parent always exists after the
-            # preceding step.
-
-            done_renames: dict[str, str] = {}   # src_path -> dst_path
-            ok = fail = 0
-
-            for orig, new in mapping:
-                orig_parts = orig.split(os.sep)
-                new_parts  = list(new.split(os.sep))   # mutable: reconciled below
-
-                if len(orig_parts) != len(new_parts):
-                    self._log(
-                        f"FAIL: path depth changed (not a rename): "
-                        f"{orig}  ->  {new}"
-                    )
-                    fail += 1
-                    continue
-
-                cur_parts = list(orig_parts)
-
-                for i in range(len(orig_parts)):
-                    op      = orig_parts[i]
-                    src_seg = os.sep.join(cur_parts[:i + 1])
-
-                    # Reconcile: if a prior row already renamed this prefix,
-                    # update cur_parts and (when the user didn't intend to
-                    # rename this segment themselves) new_parts so that the
-                    # rest of the path routes through the new name.
-                    if src_seg in done_renames:
-                        actual_dst  = done_renames[src_seg]
-                        actual_name = actual_dst.rsplit(os.sep, 1)[-1]
-                        cur_parts[i] = actual_name
-                        if new_parts[i] == op:        # user left this segment unchanged
-                            new_parts[i] = actual_name
-                        src_seg = actual_dst
-
-                    np = new_parts[i]
-                    if cur_parts[i] == np:
-                        continue                       # segment unchanged
-
-                    cur_parts[i] = np
-                    dst_seg = os.sep.join(cur_parts[:i + 1])
-
-                    if done_renames.get(src_seg) == dst_seg:
-                        continue                       # sibling already did this
-
-                    try:
-                        rename_path(src_seg, dst_seg)
-                        done_renames[src_seg] = dst_seg
-                        self._log(f"renamed: {src_seg}  ->  {dst_seg}")
-                        ok += 1
-                    except Exception as e:
-                        self._log(f"FAIL: {src_seg}  ->  {dst_seg}  ::  {e}")
-                        fail += 1
-                        break                          # can't continue this row
-
+            ok, fail, _ = rename_segment_walk(mapping, rename_path, self._log)
             self._log(f"--- renames done: {ok} ok, {fail} failed ---")
             self.after(0, self._after_apply)
 
