@@ -1,14 +1,23 @@
-# Long Path Begone (v1.0)
+# Long Path Begone (v1.1)
 
 > [!CAUTION]
 > **DISCLAIMER:**  
-> This software was generated with **Claude Code** (Anthropic), using model **Claude Opus 4.7**.  
+> This software was generated with **Claude Code** (Anthropic), using model **Claude Opus 4.7** / **Claude Sonnet 4.6**.  
 > There is no need to credit this repository - this code was not written by myself. Fork or republish at will.   
 > I only publish this because I've seen other people online looking for something similar, like Long Path Tool.   
-> **The original software will not be updated and will remain at version 1.**
-> If you build on it, please change the version number and describe your changes in the README.
-> 
+> This software will remain at version 1.x and might get small updates - nothing major is planned.
+> If you build on it, please change the version number and describe your changes in the README.md   
 > **This is completely vibe-coded but was tested on real deeply-nested folder trees and bugs were fixed!**
+
+## v1.1 Changes
+
+- **Logs tab** — activity and error logs moved from a cramped strip at the bottom to a dedicated full-page tab with both vertical and horizontal scrollbars. An unread-message count badge (`Logs (3)`) appears on the tab while you are on another page.
+- **Inline path editor** — double-clicking a NEW PATH cell now opens a full-width editor with a horizontal scrollbar so you can see and navigate the entire path without being clipped to the cell width.
+- **Column auto-fit** — after every scan the ORIGINAL PATH and NEW PATH columns are automatically widened to fit the longest path in the results, making the horizontal scrollbar actually useful.
+- **Column widths saved** — manually resized column widths are persisted to `settings.json` and restored on the next launch.
+- **Last root saved** — the most recently scanned folder path is remembered and pre-filled in the ROOT field on startup.
+- **Apply Renames always visible** — fixed a layout bug where the Apply Renames / Reset edits bar could be hidden behind the table on smaller windows.
+- **UI scaling fixed** — the scan page no longer hides the table or action buttons at the minimum window size (880 × 560).
 
 A Windows desktop tool for files and folders whose paths exceed the legacy 260-character `MAX_PATH` limit.  
 Scan a folder tree, rename paths inline or via find/replace, or copy/move/delete long-path items — all without touching the registry.  
@@ -34,7 +43,6 @@ Completely offline and self-contained!
 4. [How to Use](#how-to-use)
 5. [Features](#features)
 6. [Project Files](#project-files)
-7. [License](#license)
 
 ---
 
@@ -127,10 +135,15 @@ python -m PyInstaller --onefile --windowed --name LongPathBegone long_path_begon
 ## Features
 
 - **Scan & Rename** — Recursively walk a folder tree and list every item with its path length in a sortable table. Edit any path inline or via find/replace (literal or regex, `\1`/`$1` backreference support). Renames are applied parents-first, segment by segment — no duplicate folders are ever created.
+- **Inline path editor** — Double-click a NEW PATH cell to open a full-width editor with a horizontal scrollbar, so you can read and navigate the entire path without being clipped to the cell width.
+- **Column auto-fit** — After every scan, ORIGINAL PATH and NEW PATH columns are automatically widened to fit the longest path in the results, making the horizontal scrollbar actually useful.
+- **Column widths saved** — Manually resized column widths are persisted to `settings.json` and restored on the next launch.
+- **Last root saved** — The most recently scanned folder path is remembered and pre-filled in the ROOT field on startup.
 - **Transfer** — Copy, Move, or Delete batches of long-path items. Bypasses the Recycle Bin (deletes things Explorer refuses to touch), clears the read-only attribute, logs every operation, and continues past individual failures. Prefer Copy over Move — a copy can be verified before the source is deleted manually.
 - **Scan limit** — Stop scanning after N files (0 = unlimited).
 - **Progress & cancellation** — Cancel any scan or transfer mid-run.
 - **Column visibility** — Toggle any column in the scan table via Settings.
+- **Logs tab** — Activity and error logs on a dedicated full-page tab with both vertical and horizontal scrollbars. An unread-message badge (`Logs (3)`) appears on the tab while you are on another page.
 - **Appearance** — Light / Dark toggle, six accent colours, UI font-size slider, typeface selector. Settings persist to `settings.json` — fully portable, no registry writes.
 - **Activity log** — Save to file (appends to `activity_log.txt`) and Clear buttons.
 - **Pure Python stdlib** — No pip install needed to run from source.
@@ -143,38 +156,9 @@ python -m PyInstaller --onefile --windowed --name LongPathBegone long_path_begon
 |------|---------|
 | `long_path_begone.py` | The entire application. Pure Python, no dependencies beyond stdlib. |
 | `LongPathBegone.spec` | PyInstaller build config. Run `python -m PyInstaller LongPathBegone.spec` to produce `dist\LongPathBegone.exe`. |
-| `settings.json` | Auto-created on first run. Stores your preferences (theme, fonts, column visibility). |
+| `settings.json` | Auto-created on first run. Stores your preferences (theme, fonts, column visibility, column widths, last scanned root). |
 | `dist\LongPathBegone.exe` | Compiled standalone exe. Download or build yourself — see [Installation](#installation). |
 | `README.md` | This file. |
 | `SourceCode.md` | Line-by-line code walkthrough for every part of the app. |
 | `ERRORS.md` | Win32 error code reference and troubleshooting guide. |
-| `License.md` | Root | The Unlicense. |
-
----
-
-## License
-
-This is free and unencumbered software released into the public domain.
-
-Anyone is free to copy, modify, publish, use, compile, sell, or
-distribute this software, either in source code form or as a compiled
-binary, for any purpose, commercial or non-commercial, and by any
-means.
-
-In jurisdictions that recognize copyright laws, the author or authors
-of this software dedicate any and all copyright interest in the
-software to the public domain. We make this dedication for the benefit
-of the public at large and to the detriment of our heirs and
-successors. We intend this dedication to be an overt act of
-relinquishment in perpetuity of all present and future rights to this
-software under copyright law.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
-OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
-ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
-OTHER DEALINGS IN THE SOFTWARE.
-
-For more information, please refer to <https://unlicense.org>
+| `test_logic.py` | Unit tests for the pure-logic functions. Run with `python test_logic.py`. |
